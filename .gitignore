@@ -1,0 +1,16 @@
+# Compiled C++ extension
+*.so
+*.pyd
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Temporary Python header extraction
+/tmp/pydev_lib/
