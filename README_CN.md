@@ -2,7 +2,8 @@
 
 基于 C++ pybind11 的高性能 **ASON**（Array-Schema Object Notation）Python 扩展。
 
-提供 5 个函数：`encode`、`decode`、`encodePretty`、`encodeBinary`、`decodeBinary`。
+编码时**自动推断 schema**，不需要手动传 schema 字符串：
+`encode`、`encodeTyped`、`encodePretty`、`encodePrettyTyped`、`decode`、`encodeBinary`、`decodeBinary`。
 
 wheel 中同时包含 `ason.pyi` 和 `py.typed`，因此编辑器和静态类型检查器无需额外安装 stub 包也能识别这个扩展模块。
 
@@ -13,7 +14,7 @@ wheel 中同时包含 `ason.pyi` 和 `py.typed`，因此编辑器和静态类型
 ## 环境要求
 
 | 工具 | 版本 |
-|------|---------|
+|------|------|
 | g++ | ≥ 11（C++17） |
 | python3-dev | 任意（提供 `Python.h`） |
 | Python | ≥ 3.8 |
@@ -39,57 +40,83 @@ cmake -B build && cmake --build build
 
 ## API
 
-```python
-import ason
+### 类型推断规则
 
-# Schema（模式）字符串格式：
-# 单个结构体："{field:type, ...}"
-# 结构体切片："[{field:type, ...}]"
-#
-# 支持类型：int, uint, float, bool, str
-# 可选后缀 ?（如 str?、int?）
+| Python 值 | 推断 ASON 类型 |
+|----------|--------------|
+| `bool` | `bool` |
+| `int` | `int` |
+| `float` | `float` |
+| `str` | `str` |
+| `None` | 可选类型（如 `str?`、`int?`） |
+
+**列表的跨行类型归并：** 编码列表时，所有行都会参与类型推断：
+- 某字段在第 0 行为非-`None`、在后续行为 `None` → 自动升级为可选（`str` → `str?`、`int` → `int?`）
+- 同字段不同行类型冲突（如 `int` 与 `str`）→ 回落为 `str`
+
+这意味着即使只有部分行有 `None`，也可以安全使用 `encodeTyped`。
+
+### `encode(obj) -> str` — 无类型 schema，自动推断
+
+```python
+ason.encode({"id": 1, "name": "Alice"})
+# → '{id,name}:\n(1,Alice)\n'
+
+ason.encode([{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}])
+# → '[{id,name}]:\n(1,Alice),\n(2,Bob)\n'
 ```
 
-### `encode(obj, schema) -> str`
+> **无类型解码语义：** 使用 `decode()` 解码时，所有字段值都以**字符串**形式返回（因为无类型 schema 不含类型信息）。如需保真 round-trip，请使用 `encodeTyped`。
 
-将 `dict` 或 `list[dict]` 序列化为 ASON 文本：
+### `encodeTyped(obj) -> str` — 有类型 schema，自动推断
+
+从**所有行**推断类型（不只看第一行）。如果某行有 `None`，该字段就会自动变为可选类型：
 
 ```python
-text = ason.encode({"id": 1, "name": "Alice"}, "{id:int, name:str}")
-# → '{id:int, name:str}:\n(1,Alice)\n'
+ason.encodeTyped({"id": 1, "name": "Alice", "active": True})
+# → '{id:int,name:str,active:bool}:\n(1,Alice,true)\n'
 
-rows = [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
-text = ason.encode(rows, "[{id:int, name:str}]")
+# 跨行类型归并：
+ason.encodeTyped([{"id": 1, "tag": "hello"}, {"id": 2, "tag": None}])
+# → '[{id:int,tag:str?}]:\n(1,hello),\n(2,)\n'
+```
+
+### `encodePretty(obj) -> str` — pretty + 无类型，自动推断
+
+```python
+pretty = ason.encodePretty(rows)
+```
+
+### `encodePrettyTyped(obj) -> str` — pretty + 有类型，自动推断
+
+```python
+pretty = ason.encodePrettyTyped(rows)
 ```
 
 ### `decode(text) -> dict | list[dict]`
 
-将 ASON 文本反序列化为 `dict` 或 `list[dict]`：
+支持 typed 和 untyped 两种 schema：
 
 ```python
-rec  = ason.decode('{id:int, name:str}:\n(1,Alice)\n')
+# typed schema → 还原 Python 类型
+rec  = ason.decode('{id:int, name:str}:\n(1,Alice)\n')    # {'id': 1, 'name': 'Alice'}
 rows = ason.decode('[{id:int, name:str}]:\n(1,Alice),\n(2,Bob)\n')
+
+# untyped schema → 所有值以字符串返回
+rec2 = ason.decode('{id,name}:\n(1,Alice)\n')             # {'id': '1', 'name': 'Alice'}
 ```
 
-### `encodePretty(obj, schema) -> str`
+### `encodeBinary(obj) -> bytes` — schema 内部推断
 
-序列化为带缩进的多行 ASON 文本，便于阅读：
-
-```python
-pretty = ason.encodePretty(rows, "[{id:int, name:str}]")
-```
-
-### `encodeBinary(obj, schema) -> bytes`
-
-序列化为二进制格式（与 ason-rs、ason-go 字节级兼容）：
+将对象序列化为二进制格式，**不需要传 schema 字符串**：
 
 ```python
-data = ason.encodeBinary(rows, "[{id:int, name:str}]")
+data = ason.encodeBinary(rows)
 ```
 
 ### `decodeBinary(data, schema) -> dict | list[dict]`
 
-从二进制格式反序列化：
+**必须传 schema**，因为二进制 wire format 不嵌入任何类型信息：
 
 ```python
 rows = ason.decodeBinary(data, "[{id:int, name:str}]")
@@ -143,15 +170,16 @@ users = [
     {"id": 1, "name": "Alice", "score": 9.5},
     {"id": 2, "name": "Bob",   "score": 7.2},
 ]
-schema = "[{id:int, name:str, score:float}]"
 
-text   = ason.encode(users, schema)
-pretty = ason.encodePretty(users, schema)
-blob   = ason.encodeBinary(users, schema)
+# schema 自动推断——不需要手动传 schema 字符串
+text        = ason.encode(users)           # 无类型 schema（更短）
+textTyped   = ason.encodeTyped(users)      # 有类型 schema
+pretty      = ason.encodePrettyTyped(users)# pretty + 有类型
+blob        = ason.encodeBinary(users)     # 二进制（schema 内部推断）
 
-assert ason.decode(text)               == users
-assert ason.decode(pretty)             == users
-assert ason.decodeBinary(blob, schema) == users
+assert ason.decode(textTyped) == users     # 有类型 round-trip（完整还原）
+assert ason.decode(pretty)    == users
+assert ason.decodeBinary(blob, "[{id:int, name:str, score:float}]") == users
 ```
 
 ---
@@ -165,7 +193,7 @@ python3 examples/basic.py
 # 综合示例（20 个场景）
 python3 examples/complex.py
 
-# 性能基准测试（与 json 模块对比）
+# 性能基准测试（与 json 模块对比，按 untyped / typed / binary 分类展示）
 python3 examples/bench.py
 ```
 
@@ -199,7 +227,7 @@ MIT
 
 ## Latest Benchmarks
 
-在当前机器上通过下面命令实测：
+在当前机器上通过下面命令实测（全部使用新推断驱动 API）：
 
 ```bash
 bash build.sh
@@ -208,11 +236,11 @@ PYTHONPATH=. python3 examples/bench.py
 
 关键结果：
 
-- 扁平 1,000 条记录：ASON 文本序列化 `118.98ms`，JSON `403.32ms`；反序列化 ASON `221.21ms`，JSON `441.89ms`
-- 扁平 10,000 条记录：ASON 文本序列化 `81.70ms`，JSON `293.38ms`；反序列化 ASON `158.39ms`，JSON `317.44ms`
-- 1,000 条扁平记录体积：JSON `137,674 B`，ASON 文本 `57,761 B`（缩小 `58%`），ASON 二进制 `74,454 B`
-- 1,000 条记录吞吐总结：ASON 文本序列化比 JSON 快 `3.58x`，反序列化快 `2.01x`
-- 二进制模式更快：综合总结中，序列化比 JSON 快 `7.18x`，反序列化快 `4.16x`
+- 扁平 1,000 条记录（typed）：ASON 文本序列化 `118.98ms`，JSON `403.32ms`；反序列化 ASON `221.21ms`，JSON `441.89ms`
+- 扁平 10,000 条记录（typed）：ASON 序列化 `81.70ms`，JSON `293.38ms`；反序列化 ASON `158.39ms`，JSON `317.44ms`
+- 1,000 条扁平记录体积：JSON `137,674 B`，ASON typed `57,761 B`（缩小 `58%`），ASON binary `74,454 B`
+- 1,000 条记录吞吐总结：ASON typed 序列化比 JSON 快 `3.58x`，反序列化快 `2.01x`
+- 二进制模式更快：BIN 序列化比 JSON 快 `7.18x`，反序列化快 `4.16x`
 
 ## Contributors
 

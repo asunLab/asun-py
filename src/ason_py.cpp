@@ -1,11 +1,22 @@
-// ason_py.cpp — C++ pybind11 extension (optimized v2)
-//   encode, decode, encodePretty, encodeBinary, decodeBinary
+// ason_py.cpp — C++ pybind11 extension (inference-driven v3)
 //
-// Optimisations over v1:
-//   - Schema parsed & cached globally; field keys interned once (PyUnicode_InternInPlace)
-//   - No py::str in global cache → no crash on interpreter shutdown
-//   - Float via snprintf, LE via memcpy, dicts via _PyDict_NewPresized + PyDict_SetItem
-//   - Output buffers pre-reserved; binary decode zero-copy (PyBytes_AsStringAndSize)
+//   encode(obj)                    → str   (untyped schema, inferred)
+//   encodeTyped(obj)               → str   (typed schema, inferred)
+//   encodePretty(obj)              → str   (pretty + untyped)
+//   encodePrettyTyped(obj)         → str   (pretty + typed)
+//   decode(text)                   → dict | list[dict]
+//   encodeBinary(obj)              → bytes (schema inferred internally)
+//   decodeBinary(data, schema)     → dict | list[dict]
+//
+// Type inference rules:
+//   PyBool       → bool
+//   PyLong       → int
+//   PyFloat      → float
+//   PyUnicode    → str
+//   None         → str? (optional)
+//
+// decodeBinary still requires a schema string because the binary wire format
+// carries no embedded type information.
 //
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
@@ -49,24 +60,163 @@ static constexpr FieldType base_type(FieldType t) noexcept {
     return is_optional(t) ? (FieldType)((uint8_t)t - 5) : t;
 }
 
+static const char* type_name(FieldType ft) noexcept {
+    switch (ft) {
+        case FieldType::Int:      return "int";
+        case FieldType::Uint:     return "uint";
+        case FieldType::Float_:   return "float";
+        case FieldType::Bool:     return "bool";
+        case FieldType::Str:      return "str";
+        case FieldType::IntOpt:   return "int?";
+        case FieldType::UintOpt:  return "uint?";
+        case FieldType::FloatOpt: return "float?";
+        case FieldType::BoolOpt:  return "bool?";
+        case FieldType::StrOpt:   return "str?";
+    }
+    return "str";
+}
+
 // ---------------------------------------------------------------------------
-// CachedSchema — interned PyObject* keys, no py::str (no Py_DECREF at exit)
+// InferredField — derived from runtime Python object
+// ---------------------------------------------------------------------------
+struct InferredField {
+    std::string name;
+    FieldType   type;
+    PyObject*   key;   // interned Python str; ref owned by interning table
+};
+
+struct InferredSchema {
+    std::vector<InferredField> fields;
+    bool                       is_slice{false};
+};
+
+// ---------------------------------------------------------------------------
+// Type inference: map a PyObject* value to a FieldType
+// ---------------------------------------------------------------------------
+static FieldType infer_type(PyObject* val) noexcept {
+    if (val == Py_None)  return FieldType::StrOpt;   // null → optional str
+    if (PyBool_Check(val)) return FieldType::Bool;   // BEFORE PyLong (bool subclasses int)
+    if (PyLong_Check(val)) return FieldType::Int;
+    if (PyFloat_Check(val)) return FieldType::Float_;
+    return FieldType::Str;
+}
+
+// ---------------------------------------------------------------------------
+// Type merging: combine inferred type from multiple rows
+// Rule: if a later row has None for a field that was non-optional, upgrade to optional.
+//       Type conflicts (e.g. int vs str) → keep str (most permissive string type).
+// ---------------------------------------------------------------------------
+static FieldType merge_type(FieldType existing, FieldType incoming) noexcept {
+    // If incoming is None (StrOpt from infer_type), upgrade existing to optional
+    if (incoming == FieldType::StrOpt && existing != FieldType::StrOpt) {
+        // None encountered → make the existing type optional
+        if (!is_optional(existing))
+            return (FieldType)((uint8_t)existing + 5);  // non-opt → opt variant
+        return existing; // already optional
+    }
+    // If existing is already optional, and incoming is non-None non-optional
+    // with matching base type, keep as optional.
+    if (is_optional(existing)) {
+        FieldType eb = base_type(existing);
+        FieldType ib = (incoming == FieldType::StrOpt) ? FieldType::Str : base_type(incoming);
+        if (eb == ib) return existing;
+        // Type conflict in optional field → str? (most permissive)
+        return FieldType::StrOpt;
+    }
+    // Both non-None, non-optional
+    if (existing == incoming) return existing;
+    // Type conflict → fall back to str
+    return FieldType::Str;
+}
+
+// Build an InferredSchema by scanning ALL rows to merge types correctly.
+static InferredSchema infer_schema(PyObject* sample, bool is_slice, PyObject* all_data = nullptr) {
+    InferredSchema sc;
+    sc.is_slice = is_slice;
+
+    // --- Phase 1: infer from sample (first row / single dict) ---
+    PyObject* keys = PyDict_Keys(sample);
+    if (!keys) ason_throw("expected dict");
+    Py_ssize_t n = PyList_GET_SIZE(keys);
+
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        PyObject* k   = PyList_GET_ITEM(keys, i);
+        PyObject* val = PyDict_GetItem(sample, k);
+
+        Py_ssize_t klen;
+        const char* kstr = PyUnicode_AsUTF8AndSize(k, &klen);
+        if (!kstr) { Py_DECREF(keys); ason_throw("field key must be str"); }
+
+        PyObject* key = PyUnicode_FromStringAndSize(kstr, klen);
+        if (!key) { Py_DECREF(keys); throw std::bad_alloc(); }
+        PyUnicode_InternInPlace(&key);
+
+        sc.fields.push_back({ std::string(kstr, klen), infer_type(val), key });
+    }
+    Py_DECREF(keys);
+
+    // --- Phase 2: merge remaining rows (only for slices) ---
+    if (is_slice && all_data != nullptr) {
+        Py_ssize_t nrows = PyList_GET_SIZE(all_data);
+        for (Py_ssize_t r = 1; r < nrows; ++r) {  // start from 1 (0 = sample)
+            PyObject* rec = PyList_GET_ITEM(all_data, r);
+            for (size_t fi = 0; fi < sc.fields.size(); ++fi) {
+                PyObject* val = PyDict_GetItem(rec, sc.fields[fi].key);
+                FieldType incoming = infer_type(val ? val : Py_None);
+                sc.fields[fi].type = merge_type(sc.fields[fi].type, incoming);
+            }
+        }
+    }
+
+    return sc;
+}
+
+// Build the untyped header string, e.g. "{id,name,active}" or "[{...}]"
+static std::string build_untyped_header(const InferredSchema& sc) {
+    std::string h;
+    h.reserve(sc.fields.size() * 10 + 4);
+    if (sc.is_slice) h += '[';
+    h += '{';
+    for (size_t i = 0; i < sc.fields.size(); ++i) {
+        if (i) h += ',';
+        h += sc.fields[i].name;
+    }
+    h += '}';
+    if (sc.is_slice) h += ']';
+    return h;
+}
+
+// Build the typed header string, e.g. "{id:int,name:str,active:bool}"
+static std::string build_typed_header(const InferredSchema& sc) {
+    std::string h;
+    h.reserve(sc.fields.size() * 14 + 4);
+    if (sc.is_slice) h += '[';
+    h += '{';
+    for (size_t i = 0; i < sc.fields.size(); ++i) {
+        if (i) h += ',';
+        h += sc.fields[i].name;
+        h += ':';
+        h += type_name(sc.fields[i].type);
+    }
+    h += '}';
+    if (sc.is_slice) h += ']';
+    return h;
+}
+
+// ---------------------------------------------------------------------------
+// CachedSchema — for decodeBinary (still schema-driven)
 // ---------------------------------------------------------------------------
 struct CachedField {
     std::string name;
     FieldType   type;
-    PyObject*   key;   // interned Python str; owned by Python's interning table
+    PyObject*   key;
 };
 
 struct CachedSchema {
     std::vector<CachedField> fields;
     bool                     is_slice{false};
-    std::string              header;
 };
 
-// ---------------------------------------------------------------------------
-// Schema parser
-// ---------------------------------------------------------------------------
 static CachedSchema parse_schema(const std::string& s) {
     const char* p   = s.c_str();
     const char* end = p + s.size();
@@ -83,35 +233,35 @@ static CachedSchema parse_schema(const std::string& s) {
         if (p >= end || *p == '}') { if (p < end) ++p; break; }
 
         const char* ns = p;
-        while (p < end && *p != ':' && *p != '}' && (unsigned char)*p > ' ') ++p;
+        while (p < end && *p != ':' && *p != ',' && *p != '}' && (unsigned char)*p > ' ') ++p;
         std::string name(ns, p - ns);
 
         while (p < end && (unsigned char)*p <= ' ') ++p;
-        if (p >= end || *p != ':') ason_throw("expected ':' after field name");
-        ++p;
-        while (p < end && (unsigned char)*p <= ' ') ++p;
 
-        const char* ts = p;
-        while (p < end && *p != ',' && *p != '}' && (unsigned char)*p > ' ') ++p;
-        std::string tname(ts, p - ts);
-        bool opt = !tname.empty() && tname.back() == '?';
-        if (opt) tname.pop_back();
+        // ── typed field: "name:type" ──────────────────────────────────────────
+        FieldType ft = FieldType::Str;  // default for untyped fields
+        if (p < end && *p == ':') {
+            ++p;  // consume ':'
+            while (p < end && (unsigned char)*p <= ' ') ++p;
 
-        FieldType ft;
-        if      (tname == "int")   ft = opt ? FieldType::IntOpt   : FieldType::Int;
-        else if (tname == "uint")  ft = opt ? FieldType::UintOpt  : FieldType::Uint;
-        else if (tname == "float") ft = opt ? FieldType::FloatOpt : FieldType::Float_;
-        else if (tname == "bool")  ft = opt ? FieldType::BoolOpt  : FieldType::Bool;
-        else if (tname == "str")   ft = opt ? FieldType::StrOpt   : FieldType::Str;
-        else ason_throw("unknown type '" + tname + "' for field '" + name + "'");
+            const char* ts = p;
+            while (p < end && *p != ',' && *p != '}' && (unsigned char)*p > ' ') ++p;
+            std::string tname(ts, p - ts);
+            bool opt = !tname.empty() && tname.back() == '?';
+            if (opt) tname.pop_back();
 
-        // Intern the key for fast dict lookups; keep our strong reference alive
+            if      (tname == "int")   ft = opt ? FieldType::IntOpt   : FieldType::Int;
+            else if (tname == "uint")  ft = opt ? FieldType::UintOpt  : FieldType::Uint;
+            else if (tname == "float") ft = opt ? FieldType::FloatOpt : FieldType::Float_;
+            else if (tname == "bool")  ft = opt ? FieldType::BoolOpt  : FieldType::Bool;
+            else if (tname == "str")   ft = opt ? FieldType::StrOpt   : FieldType::Str;
+            else ason_throw("unknown type '" + tname + "' for field '" + name + "'");
+        }
+        // else: untyped field (no ':type') → treat as str (decode returns strings)
+
         PyObject* key = PyUnicode_FromStringAndSize(name.data(), (Py_ssize_t)name.size());
         if (!key) throw std::bad_alloc();
         PyUnicode_InternInPlace(&key);
-        // Note: do NOT Py_DECREF(key) here — our CachedSchema must keep the
-        // reference alive so that decode_tuple's PyDict_SetItem uses a valid key.
-
         sc.fields.push_back({std::move(name), ft, key});
 
         while (p < end && (unsigned char)*p <= ' ') ++p;
@@ -122,36 +272,9 @@ static CachedSchema parse_schema(const std::string& s) {
         if (p >= end || *p != ']') ason_throw("expected ']'");
         ++p;
     }
-
-    std::string hdr;
-    hdr.reserve(sc.fields.size() * 12 + 4);
-    if (sc.is_slice) hdr += '[';
-    hdr += '{';
-    for (size_t i = 0; i < sc.fields.size(); ++i) {
-        if (i) hdr += ", ";
-        hdr += sc.fields[i].name; hdr += ':';
-        switch (sc.fields[i].type) {
-            case FieldType::Int:      hdr += "int";    break;
-            case FieldType::Uint:     hdr += "uint";   break;
-            case FieldType::Float_:   hdr += "float";  break;
-            case FieldType::Bool:     hdr += "bool";   break;
-            case FieldType::Str:      hdr += "str";    break;
-            case FieldType::IntOpt:   hdr += "int?";   break;
-            case FieldType::UintOpt:  hdr += "uint?";  break;
-            case FieldType::FloatOpt: hdr += "float?"; break;
-            case FieldType::BoolOpt:  hdr += "bool?";  break;
-            case FieldType::StrOpt:   hdr += "str?";   break;
-        }
-    }
-    hdr += '}';
-    if (sc.is_slice) hdr += ']';
-    sc.header = std::move(hdr);
     return sc;
 }
 
-// ---------------------------------------------------------------------------
-// Global schema cache
-// ---------------------------------------------------------------------------
 static std::mutex                                    g_schema_mutex;
 static std::unordered_map<std::string, CachedSchema> g_schema_cache;
 
@@ -164,7 +287,7 @@ static const CachedSchema& get_schema(const std::string& s) {
 }
 
 // ---------------------------------------------------------------------------
-// Float formatting (snprintf, no heap)
+// Float formatting
 // ---------------------------------------------------------------------------
 static void append_float(std::string& out, double v) {
     if (std::isnan(v))  { out += "nan"; return; }
@@ -176,7 +299,6 @@ static void append_float(std::string& out, double v) {
         out.append(buf, len);
         return;
     }
-    // Use std::to_chars for max performance on the general path
     auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), v);
     if (ec == std::errc()) {
         std::string_view sv(buf, ptr - buf);
@@ -233,7 +355,7 @@ static void append_escaped(std::string& out, const char* s, size_t n) {
 }
 
 // ---------------------------------------------------------------------------
-// LE helpers (memcpy = single instruction on x86/arm)
+// LE helpers
 // ---------------------------------------------------------------------------
 static inline void push_le32(std::vector<uint8_t>& b, uint32_t v) {
     size_t pos = b.size(); b.resize(pos + 4);
@@ -269,9 +391,8 @@ static inline uint64_t read_le64(const uint8_t*& p, const uint8_t* end) {
 }
 
 // ---------------------------------------------------------------------------
-// Text encode — raw CPython API (no pybind11 wrappers in hot path)
+// Fast integer formatting
 // ---------------------------------------------------------------------------
-// Fast digit-pair table for integer formatting
 static const char DEC_PAIR[] =
     "00010203040506070809"
     "10111213141516171819"
@@ -288,61 +409,39 @@ static void append_i64(std::string& out, long long v) {
     if (v < 0) {
         out += '-';
         if (v == std::numeric_limits<long long>::min()) {
-            out += "9223372036854775808";
-            return;
+            out += "9223372036854775808"; return;
         }
         v = -v;
     }
     auto uv = static_cast<unsigned long long>(v);
-    char tmp[20];
-    int i = 20;
-    while (uv >= 100) {
-        auto idx = (uv % 100) * 2;
-        uv /= 100;
-        tmp[--i] = DEC_PAIR[idx + 1];
-        tmp[--i] = DEC_PAIR[idx];
-    }
-    if (uv >= 10) {
-        auto idx = uv * 2;
-        tmp[--i] = DEC_PAIR[idx + 1];
-        tmp[--i] = DEC_PAIR[idx];
-    } else {
-        tmp[--i] = '0' + (char)uv;
-    }
-    out.append(tmp + i, 20 - i);
+    char tmp[20]; int i = 20;
+    while (uv >= 100) { auto idx=(uv%100)*2; uv/=100; tmp[--i]=DEC_PAIR[idx+1]; tmp[--i]=DEC_PAIR[idx]; }
+    if (uv >= 10) { auto idx=uv*2; tmp[--i]=DEC_PAIR[idx+1]; tmp[--i]=DEC_PAIR[idx]; }
+    else tmp[--i]='0'+(char)uv;
+    out.append(tmp+i, 20-i);
 }
 
 static void append_u64(std::string& out, unsigned long long uv) {
-    char tmp[20];
-    int i = 20;
-    while (uv >= 100) {
-        auto idx = (uv % 100) * 2;
-        uv /= 100;
-        tmp[--i] = DEC_PAIR[idx + 1];
-        tmp[--i] = DEC_PAIR[idx];
-    }
-    if (uv >= 10) {
-        auto idx = uv * 2;
-        tmp[--i] = DEC_PAIR[idx + 1];
-        tmp[--i] = DEC_PAIR[idx];
-    } else {
-        tmp[--i] = '0' + (char)uv;
-    }
-    out.append(tmp + i, 20 - i);
+    char tmp[20]; int i = 20;
+    while (uv >= 100) { auto idx=(uv%100)*2; uv/=100; tmp[--i]=DEC_PAIR[idx+1]; tmp[--i]=DEC_PAIR[idx]; }
+    if (uv >= 10) { auto idx=uv*2; tmp[--i]=DEC_PAIR[idx+1]; tmp[--i]=DEC_PAIR[idx]; }
+    else tmp[--i]='0'+(char)uv;
+    out.append(tmp+i, 20-i);
 }
 
-static void encode_value(std::string& out, PyObject* val, FieldType ft) {
+// ---------------------------------------------------------------------------
+// Encode a single value with inferred type
+// ---------------------------------------------------------------------------
+static void encode_value_inferred(std::string& out, PyObject* val, FieldType ft) {
     if (is_optional(ft)) {
-        if (val == Py_None) return;
+        if (val == Py_None) return;   // empty field
         ft = base_type(ft);
     }
     switch (ft) {
         case FieldType::Int:
-            append_i64(out, PyLong_AsLongLong(val));
-            break;
+            append_i64(out, PyLong_AsLongLong(val)); break;
         case FieldType::Uint:
-            append_u64(out, PyLong_AsUnsignedLongLong(val));
-            break;
+            append_u64(out, PyLong_AsUnsignedLongLong(val)); break;
         case FieldType::Float_:
             append_float(out, PyFloat_AsDouble(val)); break;
         case FieldType::Bool:
@@ -359,9 +458,9 @@ static void encode_value(std::string& out, PyObject* val, FieldType ft) {
 }
 
 // ---------------------------------------------------------------------------
-// Binary encode
+// Binary encode with inferred type
 // ---------------------------------------------------------------------------
-static void encode_bin_value(std::vector<uint8_t>& buf, PyObject* val, FieldType ft) {
+static void encode_bin_value_inferred(std::vector<uint8_t>& buf, PyObject* val, FieldType ft) {
     if (is_optional(ft)) {
         if (val == Py_None) { buf.push_back(0); return; }
         buf.push_back(1);
@@ -391,91 +490,116 @@ static void encode_bin_value(std::vector<uint8_t>& buf, PyObject* val, FieldType
 }
 
 // ---------------------------------------------------------------------------
-// encode(obj, schema) → str
+// Internal: encode all rows from inferred schema into 'out'
 // ---------------------------------------------------------------------------
-static std::string ason_encode(py::object obj, const std::string& schema_str) {
-    const CachedSchema& sc = get_schema(schema_str);
-    std::string out;
-    size_t nf = sc.fields.size();
+static void encode_rows(std::string& out, const InferredSchema& sc, PyObject* data, bool pretty) {
+    const char* sep = pretty ? ", " : ",";
 
     if (sc.is_slice) {
-        PyObject* lst = obj.ptr();
+        PyObject* lst = data;
         Py_ssize_t n  = PyList_GET_SIZE(lst);
-        out.reserve(sc.header.size() + 2 + (size_t)n * (nf * 12 + 6));
-        out += sc.header; out += ":\n";
         for (Py_ssize_t i = 0; i < n; ++i) {
             PyObject* rec = PyList_GET_ITEM(lst, i);
+            if (pretty) out += "    ";
             out += '(';
-            for (size_t j = 0; j < nf; ++j) {
-                if (j) out += ',';
+            for (size_t j = 0; j < sc.fields.size(); ++j) {
+                if (j) out += sep;
                 PyObject* val = PyDict_GetItem(rec, sc.fields[j].key);
-                encode_value(out, val ? val : Py_None, sc.fields[j].type);
+                encode_value_inferred(out, val ? val : Py_None, sc.fields[j].type);
             }
             out += ')';
             if (i + 1 < n) out += ',';
             out += '\n';
         }
     } else {
-        PyObject* rec = obj.ptr();
-        out.reserve(sc.header.size() + 2 + nf * 16);
-        out += sc.header; out += ":\n(";
-        for (size_t j = 0; j < nf; ++j) {
-            if (j) out += ',';
+        PyObject* rec = data;
+        if (pretty) out += "    ";
+        out += '(';
+        for (size_t j = 0; j < sc.fields.size(); ++j) {
+            if (j) out += sep;
             PyObject* val = PyDict_GetItem(rec, sc.fields[j].key);
-            encode_value(out, val ? val : Py_None, sc.fields[j].type);
+            encode_value_inferred(out, val ? val : Py_None, sc.fields[j].type);
         }
         out += ")\n";
     }
-    return out;
 }
 
 // ---------------------------------------------------------------------------
-// encodePretty(obj, schema) → str
+// encode(obj) → str   [untyped schema, inferred]
 // ---------------------------------------------------------------------------
-static std::string ason_encode_pretty(py::object obj, const std::string& schema_str) {
-    const CachedSchema& sc = get_schema(schema_str);
+static std::string ason_encode(py::object obj) {
+    PyObject* ptr = obj.ptr();
+    bool is_slice = PyList_Check(ptr);
+    PyObject* sample = is_slice ? (PyList_GET_SIZE(ptr) > 0 ? PyList_GET_ITEM(ptr, 0) : nullptr) : ptr;
+
+    if (is_slice && !sample) return "[{}]:\n";
+
+    InferredSchema sc = infer_schema(sample, is_slice, is_slice ? ptr : nullptr);
     std::string out;
-    size_t nf = sc.fields.size();
-
-    if (sc.is_slice) {
-        PyObject* lst = obj.ptr();
-        Py_ssize_t n  = PyList_GET_SIZE(lst);
-        out.reserve(sc.header.size() + 2 + (size_t)n * (nf * 14 + 10));
-        out += sc.header; out += ":\n";
-        for (Py_ssize_t i = 0; i < n; ++i) {
-            PyObject* rec = PyList_GET_ITEM(lst, i);
-            out += "    (";
-            for (size_t j = 0; j < nf; ++j) {
-                if (j) out += ", ";
-                PyObject* val = PyDict_GetItem(rec, sc.fields[j].key);
-                encode_value(out, val ? val : Py_None, sc.fields[j].type);
-            }
-            out += ')';
-            if (i + 1 < n) out += ',';
-            out += '\n';
-        }
-    } else {
-        PyObject* rec = obj.ptr();
-        out.reserve(sc.header.size() + 2 + nf * 18);
-        out += sc.header; out += ":\n    (";
-        for (size_t j = 0; j < nf; ++j) {
-            if (j) out += ", ";
-            PyObject* val = PyDict_GetItem(rec, sc.fields[j].key);
-            encode_value(out, val ? val : Py_None, sc.fields[j].type);
-        }
-        out += ")\n";
-    }
+    out.reserve(sc.fields.size() * 12 + 4);
+    out += build_untyped_header(sc) + ":\n";
+    encode_rows(out, sc, ptr, false);
     return out;
 }
 
 // ---------------------------------------------------------------------------
-// Text decode helpers
+// encodeTyped(obj) → str   [typed schema, inferred]
+// ---------------------------------------------------------------------------
+static std::string ason_encode_typed(py::object obj) {
+    PyObject* ptr = obj.ptr();
+    bool is_slice = PyList_Check(ptr);
+    PyObject* sample = is_slice ? (PyList_GET_SIZE(ptr) > 0 ? PyList_GET_ITEM(ptr, 0) : nullptr) : ptr;
+
+    if (is_slice && !sample) return "[{}]:\n";
+
+    InferredSchema sc = infer_schema(sample, is_slice, is_slice ? ptr : nullptr);
+    std::string out;
+    out += build_typed_header(sc) + ":\n";
+    encode_rows(out, sc, ptr, false);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// encodePretty(obj) → str   [pretty + untyped]
+// ---------------------------------------------------------------------------
+static std::string ason_encode_pretty(py::object obj) {
+    PyObject* ptr = obj.ptr();
+    bool is_slice = PyList_Check(ptr);
+    PyObject* sample = is_slice ? (PyList_GET_SIZE(ptr) > 0 ? PyList_GET_ITEM(ptr, 0) : nullptr) : ptr;
+
+    if (is_slice && !sample) return "[{}]:\n";
+
+    InferredSchema sc = infer_schema(sample, is_slice, is_slice ? ptr : nullptr);
+    std::string out;
+    out += build_untyped_header(sc) + ":\n";
+    encode_rows(out, sc, ptr, true);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// encodePrettyTyped(obj) → str   [pretty + typed]
+// ---------------------------------------------------------------------------
+static std::string ason_encode_pretty_typed(py::object obj) {
+    PyObject* ptr = obj.ptr();
+    bool is_slice = PyList_Check(ptr);
+    PyObject* sample = is_slice ? (PyList_GET_SIZE(ptr) > 0 ? PyList_GET_ITEM(ptr, 0) : nullptr) : ptr;
+
+    if (is_slice && !sample) return "[{}]:\n";
+
+    InferredSchema sc = infer_schema(sample, is_slice, is_slice ? ptr : nullptr);
+    std::string out;
+    out += build_typed_header(sc) + ":\n";
+    encode_rows(out, sc, ptr, true);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Text decode helpers (unchanged from v2)
 // ---------------------------------------------------------------------------
 static inline void skip_ws(const char*& p, const char* end) noexcept {
     while (p < end && (unsigned char)*p <= ' ') ++p;
 }
 
-// Returns new reference (always)
 static PyObject* decode_value(const char*& p, const char* end, FieldType ft, std::string& tmp) {
     skip_ws(p, end);
     if (is_optional(ft)) {
@@ -537,7 +661,6 @@ static PyObject* decode_value(const char*& p, const char* end, FieldType ft, std
     }
 }
 
-// Returns new dict reference
 static PyObject* decode_tuple(const char*& p, const char* end, const CachedSchema& sc, std::string& tmp) {
     skip_ws(p, end);
     if (p >= end || *p != '(') ason_throw("expected '('");
@@ -555,7 +678,7 @@ static PyObject* decode_tuple(const char*& p, const char* end, const CachedSchem
         PyObject* val = decode_value(p, end, sc.fields[i].type, tmp);
         if (!val) { Py_DECREF(rec); throw py::error_already_set(); }
         PyDict_SetItem(rec, sc.fields[i].key, val);
-        Py_DECREF(val);  // dict now owns it
+        Py_DECREF(val);
     }
     skip_ws(p, end);
     if (p >= end || *p != ')') { Py_DECREF(rec); ason_throw("expected ')'"); }
@@ -585,7 +708,7 @@ static py::object ason_decode(const std::string& text) {
     if (p >= end || *p != ':') ason_throw("expected ':'");
     ++p;
 
-    std::string tmp;  // buffer for string unescaping
+    std::string tmp;
 
     if (schema.is_slice) {
         std::vector<PyObject*> rows;
@@ -605,7 +728,6 @@ static py::object ason_decode(const std::string& text) {
         skip_ws(p, end);
         PyObject* rec = decode_tuple(p, end, schema, tmp);
         if (!rec) throw py::error_already_set();
-        // Reject trailing rows after a single-struct schema
         const char* tp = p;
         while (tp < end && ((unsigned char)*tp <= ' ' || *tp == ',')) ++tp;
         if (tp < end && *tp == '(') { Py_DECREF(rec); ason_throw("trailing rows not allowed for struct schema"); }
@@ -614,37 +736,44 @@ static py::object ason_decode(const std::string& text) {
 }
 
 // ---------------------------------------------------------------------------
-// encodeBinary(obj, schema) → bytes
+// encodeBinary(obj) → bytes   [schema inferred internally]
 // ---------------------------------------------------------------------------
-static py::bytes ason_encode_binary(py::object obj, const std::string& schema_str) {
-    const CachedSchema& sc = get_schema(schema_str);
+static py::bytes ason_encode_binary(py::object obj) {
+    PyObject* ptr = obj.ptr();
+    bool is_slice = PyList_Check(ptr);
+    PyObject* sample = is_slice ? (PyList_GET_SIZE(ptr) > 0 ? PyList_GET_ITEM(ptr, 0) : nullptr) : ptr;
+
     std::vector<uint8_t> buf;
 
-    if (sc.is_slice) {
-        PyObject* lst = obj.ptr();
-        Py_ssize_t n  = PyList_GET_SIZE(lst);
+    if (is_slice) {
+        if (!sample) {
+            push_le32(buf, 0);
+            return py::bytes((const char*)buf.data(), buf.size());
+        }
+        InferredSchema sc = infer_schema(sample, true, ptr);
+        Py_ssize_t n = PyList_GET_SIZE(ptr);
         buf.reserve(4 + (size_t)n * sc.fields.size() * 10);
         push_le32(buf, (uint32_t)n);
         for (Py_ssize_t i = 0; i < n; ++i) {
-            PyObject* rec = PyList_GET_ITEM(lst, i);
+            PyObject* rec = PyList_GET_ITEM(ptr, i);
             for (auto& f : sc.fields) {
                 PyObject* val = PyDict_GetItem(rec, f.key);
-                encode_bin_value(buf, val ? val : Py_None, f.type);
+                encode_bin_value_inferred(buf, val ? val : Py_None, f.type);
             }
         }
     } else {
-        PyObject* rec = obj.ptr();
+        InferredSchema sc = infer_schema(ptr, false);
         buf.reserve(sc.fields.size() * 10);
         for (auto& f : sc.fields) {
-            PyObject* val = PyDict_GetItem(rec, f.key);
-            encode_bin_value(buf, val ? val : Py_None, f.type);
+            PyObject* val = PyDict_GetItem(ptr, f.key);
+            encode_bin_value_inferred(buf, val ? val : Py_None, f.type);
         }
     }
     return py::bytes((const char*)buf.data(), buf.size());
 }
 
 // ---------------------------------------------------------------------------
-// Binary decode — decode one record into pre-allocated dict
+// Binary decode helper (unchanged from v2)
 // ---------------------------------------------------------------------------
 static inline PyObject* decode_bin_field(const uint8_t*& p, const uint8_t* end, FieldType ft) {
     if (is_optional(ft)) {
@@ -677,6 +806,9 @@ static inline PyObject* decode_bin_field(const uint8_t*& p, const uint8_t* end, 
     }
 }
 
+// ---------------------------------------------------------------------------
+// decodeBinary(data, schema) — schema required (binary has no embedded types)
+// ---------------------------------------------------------------------------
 static py::object ason_decode_binary(py::bytes data, const std::string& schema_str) {
     const CachedSchema& sc = get_schema(schema_str);
 
@@ -699,7 +831,7 @@ static py::object ason_decode_binary(py::bytes data, const std::string& schema_s
                 PyDict_SetItem(rec, f.key, val);
                 Py_DECREF(val);
             }
-            PyList_SET_ITEM(lst, (Py_ssize_t)i, rec);  // steals ref
+            PyList_SET_ITEM(lst, (Py_ssize_t)i, rec);
         }
         if (p != end) { Py_DECREF(lst); ason_throw("trailing binary data"); }
         return py::reinterpret_steal<py::object>(lst);
@@ -720,12 +852,21 @@ static py::object ason_decode_binary(py::bytes data, const std::string& schema_s
 // Module
 // ---------------------------------------------------------------------------
 PYBIND11_MODULE(ason, m) {
-    m.doc() = "ASON — Array-Schema Object Notation (optimized C++ pybind11 extension).";
+    m.doc() = "ASON — Array-Schema Object Notation (inference-driven C++ pybind11 extension).";
     py::register_exception<std::runtime_error>(m, "AsonError");
 
-    m.def("encode",       &ason_encode,        py::arg("obj"), py::arg("schema"));
-    m.def("decode",       &ason_decode,        py::arg("text"));
-    m.def("encodePretty", &ason_encode_pretty, py::arg("obj"), py::arg("schema"));
-    m.def("encodeBinary", &ason_encode_binary, py::arg("obj"), py::arg("schema"));
-    m.def("decodeBinary", &ason_decode_binary, py::arg("data"), py::arg("schema"));
+    m.def("encode",           &ason_encode,           py::arg("obj"),
+          "Encode obj to ASON text with inferred untyped schema.");
+    m.def("encodeTyped",      &ason_encode_typed,     py::arg("obj"),
+          "Encode obj to ASON text with inferred typed schema.");
+    m.def("encodePretty",     &ason_encode_pretty,    py::arg("obj"),
+          "Encode obj to pretty ASON text with inferred untyped schema.");
+    m.def("encodePrettyTyped",&ason_encode_pretty_typed, py::arg("obj"),
+          "Encode obj to pretty ASON text with inferred typed schema.");
+    m.def("decode",           &ason_decode,           py::arg("text"),
+          "Decode ASON text to dict or list[dict].");
+    m.def("encodeBinary",     &ason_encode_binary,    py::arg("obj"),
+          "Encode obj to ASON binary format (schema inferred internally).");
+    m.def("decodeBinary",     &ason_decode_binary,    py::arg("data"), py::arg("schema"),
+          "Decode ASON binary bytes. schema is required because binary wire format embeds no type info.");
 }

@@ -2,7 +2,8 @@
 
 C++ pybind11 extension for **ASON** (Array-Schema Object Notation).
 
-Provides 5 functions: `encode`, `decode`, `encodePretty`, `encodeBinary`, `decodeBinary`.
+Provides 7 functions without requiring manual schema strings for encoding:
+`encode`, `encodeTyped`, `encodePretty`, `encodePrettyTyped`, `decode`, `encodeBinary`, `decodeBinary`.
 
 The wheel also ships `ason.pyi` and `py.typed`, so editors and static type checkers can understand the extension module without a separate stub package.
 
@@ -39,47 +40,81 @@ cmake -B build && cmake --build build
 
 ## API
 
-```python
-import ason
+### Type inference rules
 
-# Schema strings
-# Single struct : "{field:type, ...}"
-# Slice of structs: "[{field:type, ...}]"
-#
-# Types: int, uint, float, bool, str
-# Optional suffix ?  (e.g. str?, int?)
+| Python value | Inferred ASON type |
+|-------------|--------------------|
+| `bool` | `bool` |
+| `int` | `int` |
+| `float` | `float` |
+| `str` | `str` |
+| `None` | optional (e.g. `str?`, `int?`) |
+
+**Cross-row type merging for lists:** When encoding a list, all rows are scanned to compute the final type:
+- A field that is non-`None` in row 0 but `None` in some later row is promoted to optional (e.g. `str` → `str?`, `int` → `int?`).
+- Type conflicts between non-`None` values (e.g. `int` in row 0, `str` in row 1) fall back to `str`.
+
+This means `encodeTyped` is safe to use even when only some rows have `None` for a given field.
+
+### `encode(obj) -> str` — untyped schema, inferred
+
+```python
+ason.encode({"id": 1, "name": "Alice"})
+# → '{id,name}:\n(1,Alice)\n'
+
+ason.encode([{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}])
+# → '[{id,name}]:\n(1,Alice),\n(2,Bob)\n'
 ```
 
-### `encode(obj, schema) -> str`
+> **Untyped decode semantics:** When decoded with `decode()`, all field values are returned as **strings** because the untyped schema carries no type information. Use `encodeTyped` when you need a type-preserving round-trip.
+
+### `encodeTyped(obj) -> str` — typed schema, inferred
+
+Type is inferred from all rows (not just the first). A field that is `None` in any row is made optional:
 
 ```python
-text = ason.encode({"id": 1, "name": "Alice"}, "{id:int, name:str}")
-# → '{id:int, name:str}:\n(1,Alice)\n'
+ason.encodeTyped({"id": 1, "name": "Alice", "active": True})
+# → '{id:int,name:str,active:bool}:\n(1,Alice,true)\n'
 
-rows = [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
-text = ason.encode(rows, "[{id:int, name:str}]")
+# Optional field inferred from cross-row merging:
+ason.encodeTyped([{"id": 1, "tag": "hello"}, {"id": 2, "tag": None}])
+# → '[{id:int,tag:str?}]:\n(1,hello),\n(2,)\n'
+```
+
+### `encodePretty(obj) -> str` — pretty + untyped, inferred
+
+```python
+pretty = ason.encodePretty(rows)
+```
+
+### `encodePrettyTyped(obj) -> str` — pretty + typed, inferred
+
+```python
+pretty = ason.encodePrettyTyped(rows)
 ```
 
 ### `decode(text) -> dict | list[dict]`
 
+Decodes both typed and untyped schemas embedded in the text:
+
 ```python
-rec  = ason.decode('{id:int, name:str}:\n(1,Alice)\n')
+# typed schema → values restored as Python types
+rec  = ason.decode('{id:int, name:str}:\n(1,Alice)\n')    # {'id': 1, 'name': 'Alice'}
 rows = ason.decode('[{id:int, name:str}]:\n(1,Alice),\n(2,Bob)\n')
+
+# untyped schema → all values returned as strings
+rec2 = ason.decode('{id,name}:\n(1,Alice)\n')             # {'id': '1', 'name': 'Alice'}
 ```
 
-### `encodePretty(obj, schema) -> str`
+### `encodeBinary(obj) -> bytes` — schema inferred internally
 
 ```python
-pretty = ason.encodePretty(rows, "[{id:int, name:str}]")
-```
-
-### `encodeBinary(obj, schema) -> bytes`
-
-```python
-data = ason.encodeBinary(rows, "[{id:int, name:str}]")
+data = ason.encodeBinary(rows)
 ```
 
 ### `decodeBinary(data, schema) -> dict | list[dict]`
+
+Schema is required because the binary wire format carries no embedded type information:
 
 ```python
 rows = ason.decodeBinary(data, "[{id:int, name:str}]")
@@ -133,15 +168,16 @@ users = [
     {"id": 1, "name": "Alice", "score": 9.5},
     {"id": 2, "name": "Bob",   "score": 7.2},
 ]
-schema = "[{id:int, name:str, score:float}]"
 
-text   = ason.encode(users, schema)
-pretty = ason.encodePretty(users, schema)
-blob   = ason.encodeBinary(users, schema)
+# Schema is inferred automatically—no schema string needed
+text        = ason.encode(users)           # untyped schema
+textTyped   = ason.encodeTyped(users)      # typed schema (use for round-trip)
+pretty      = ason.encodePrettyTyped(users)# pretty + typed
+blob        = ason.encodeBinary(users)     # binary (schema inferred internally)
 
-assert ason.decode(text)               == users
-assert ason.decode(pretty)             == users
-assert ason.decodeBinary(blob, schema) == users
+assert ason.decode(textTyped)  == users    # typed round-trip
+assert ason.decode(pretty)     == users
+assert ason.decodeBinary(blob, "[{id:int, name:str, score:float}]") == users
 ```
 
 ## Latest Benchmarks
