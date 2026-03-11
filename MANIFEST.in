@@ -1,6 +1,5 @@
 include README.md
-include LICENSE*
 include CMakeLists.txt
 include ason.pyi
 include py.typed
-recursive-include src *.cpp *.h *.hpp
+recursive-include src *.cpp

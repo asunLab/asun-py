@@ -8,14 +8,13 @@ version = "0.1.0"
 description = "High-performance ASON (Array-Schema Object Notation) Python extension."
 readme = "README.md"
 requires-python = ">=3.8"
-license = { text = "MIT" }
+license = "MIT"
 authors = [
   { name = "ason contributors" }
 ]
 keywords = ["ason", "serialization", "schema", "llm", "data-format"]
 classifiers = [
   "Development Status :: 3 - Alpha",
-  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.8",

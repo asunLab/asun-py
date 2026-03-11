@@ -16,7 +16,8 @@ class CMakeBuild(build_ext):
     def build_extension(self, ext):
         build_tmp = Path(self.build_temp) / ext.name
         build_tmp.mkdir(parents=True, exist_ok=True)
-        ext_dir = Path(self.get_ext_fullpath(ext.name)).parent.resolve()
+        ext_path = Path(self.get_ext_fullpath(ext.name)).resolve()
+        ext_dir = ext_path.parent
 
         cfg = "Debug" if self.debug else "Release"
         cmake_args = [
@@ -34,6 +35,13 @@ class CMakeBuild(build_ext):
             ["cmake", "--build", str(build_tmp)] + build_args,
         )
 
+        # Ship typing metadata alongside the extension module so type checkers
+        # can discover it from the installed wheel (PEP 561, top-level module).
+        for filename in ("ason.pyi", "py.typed"):
+            src = Path(__file__).parent / filename
+            dst = ext_dir / filename
+            dst.write_bytes(src.read_bytes())
+
 
 setup(
     name="ason",
@@ -45,7 +53,6 @@ setup(
     ext_modules=[CMakeExtension("ason")],
     cmdclass={"build_ext": CMakeBuild},
     python_requires=">=3.8",
-    license="MIT",
     url="https://github.com/ason-lab/ason-py",
     project_urls={
         "Repository": "https://github.com/ason-lab/ason-py",
@@ -59,7 +66,5 @@ setup(
         "Programming Language :: Python :: Implementation :: CPython",
         "Topic :: Software Development :: Libraries",
     ],
-    include_package_data=True,
-    data_files=[("", ["ason.pyi", "py.typed"])],
     zip_safe=False,
 )
