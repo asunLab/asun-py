@@ -417,7 +417,7 @@ static bool needs_quoting(const char* s, size_t n) noexcept {
     for (size_t i = 0; i < n; ++i) {
         unsigned char c = (unsigned char)s[i];
         if (c < 32 || c == ',' || c == '(' || c == ')' ||
-            c == '[' || c == ']' || c == '"' || c == '\\') return true;
+            c == '[' || c == ']' || c == '@' || c == '"' || c == '\\') return true;
         if (all_num && i >= ni && !(c >= '0' && c <= '9') && c != '.') all_num = false;
     }
     if (all_num && n > ni) return true;

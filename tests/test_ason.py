@@ -235,6 +235,16 @@ class TestStringEscaping:
         rec = {"s": ""}
         assert ason.decode(ason.encodeTyped(rec))["s"] == ""
 
+    def test_at_string_roundtrip_all_apis(self):
+        obj = {"s": "@Alice"}
+        plain = ason.encode(obj)
+        assert '"@Alice"' in plain
+        assert ason.decode(plain) == obj
+        assert ason.decode(ason.encodeTyped(obj)) == obj
+        assert ason.decode(ason.encodePretty(obj)) == obj
+        assert ason.decode(ason.encodePrettyTyped(obj)) == obj
+        assert ason.decodeBinary(ason.encodeBinary(obj), '{s@str}') == obj
+
 
 # ---------------------------------------------------------------------------
 # 7.  Special float values
