@@ -106,6 +106,12 @@ rows = ason.decode('[{id@int, name@str}]:\n(1,Alice),\n(2,Bob)\n')
 rec2 = ason.decode('{id,name}:\n(1,Alice)\n')             # {'id': '1', 'name': 'Alice'}
 ```
 
+Block comments are supported anywhere whitespace is allowed:
+
+```python
+rec = ason.decode('/* top */ {id@int,name@str}: /* row */ (1, /* name */ Alice)')
+```
+
 ### `encodeBinary(obj) -> bytes` — schema inferred internally
 
 ```python

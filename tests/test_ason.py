@@ -310,6 +310,10 @@ class TestDecodeErrors:
         with pytest.raises(ason.AsonError):
             ason.encodeTyped({"cfg": {"name": "web"}})
 
+    def test_unclosed_block_comment_rejected(self):
+        with pytest.raises(ason.AsonError):
+            ason.decode("/* broken {id@int,name@str}:(1,Alice)")
+
 
 # ---------------------------------------------------------------------------
 # 9.  Format validation
@@ -337,6 +341,26 @@ class TestFormatValidation:
         rows = [{"id": 7, "name": "Carol"}]
         out = ason.decode(ason.encodeTyped(rows))
         assert out == rows
+
+    def test_block_comments_before_and_between_tokens(self):
+        text = '/* top */ {id@int, name@str, active@bool}: /* row */ (1, /* name */ Alice, true)'
+        out = ason.decode(text)
+        assert out == {"id": 1, "name": "Alice", "active": True}
+
+    def test_block_comments_between_rows_in_slice(self):
+        text = '/* users */ [{id@int,name@str}]: /* first */ (1,Alice), /* second */ (2,Bob)'
+        out = ason.decode(text)
+        assert out == [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+
+    def test_block_comment_after_plain_value_before_comma(self):
+        text = '{id@int,name@str,active@bool}:(1,Alice /* name */,true)'
+        out = ason.decode(text)
+        assert out == {"id": 1, "name": "Alice", "active": True}
+
+    def test_block_comments_inside_schema(self):
+        text = '{id@int, /* label */ name@str, active@bool}:(1,Alice,true)'
+        out = ason.decode(text)
+        assert out == {"id": 1, "name": "Alice", "active": True}
 
 
 # ---------------------------------------------------------------------------

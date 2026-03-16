@@ -275,6 +275,20 @@ struct CachedSchema {
     bool                     is_slice{false};
 };
 
+static inline void skip_ws_comments(const char*& p, const char* end) {
+    while (p < end) {
+        while (p < end && (unsigned char)*p <= ' ') ++p;
+        if (p + 1 < end && p[0] == '/' && p[1] == '*') {
+            p += 2;
+            while (p + 1 < end && !(p[0] == '*' && p[1] == '/')) ++p;
+            if (p + 1 >= end) ason_throw("unterminated block comment");
+            p += 2;
+            continue;
+        }
+        break;
+    }
+}
+
 static CachedSchema parse_schema(const std::string& s) {
     const char* p   = s.c_str();
     const char* end = p + s.size();
@@ -284,14 +298,14 @@ static CachedSchema parse_schema(const std::string& s) {
         ason_throw("legacy map syntax '<...>' is not supported; use arrays or entry lists instead");
     }
 
-    while (p < end && (unsigned char)*p <= ' ') ++p;
+    skip_ws_comments(p, end);
     if (p < end && *p == '[') { sc.is_slice = true; ++p; }
-    while (p < end && (unsigned char)*p <= ' ') ++p;
+    skip_ws_comments(p, end);
     if (p >= end || *p != '{') ason_throw("schema must start with '{'");
     ++p;
 
     while (p < end) {
-        while (p < end && (unsigned char)*p <= ' ') ++p;
+        skip_ws_comments(p, end);
         if (p >= end || *p == '}') { if (p < end) ++p; break; }
 
         std::string name;
@@ -323,13 +337,13 @@ static CachedSchema parse_schema(const std::string& s) {
             name.assign(ns, p - ns);
         }
 
-        while (p < end && (unsigned char)*p <= ' ') ++p;
+        skip_ws_comments(p, end);
 
         // ── typed field: "name@type" ──────────────────────────────────────────
         FieldType ft = FieldType::Str;  // default for untyped fields
         if (p < end && *p == '@') {
             ++p;  // consume '@'
-            while (p < end && (unsigned char)*p <= ' ') ++p;
+            skip_ws_comments(p, end);
 
             const char* ts = p;
             while (p < end && *p != ',' && *p != '}' && (unsigned char)*p > ' ') ++p;
@@ -354,11 +368,11 @@ static CachedSchema parse_schema(const std::string& s) {
         PyUnicode_InternInPlace(&key);
         sc.fields.push_back({std::move(name), ft, key});
 
-        while (p < end && (unsigned char)*p <= ' ') ++p;
+        skip_ws_comments(p, end);
         if (p < end && *p == ',') ++p;
     }
     if (sc.is_slice) {
-        while (p < end && (unsigned char)*p <= ' ') ++p;
+        skip_ws_comments(p, end);
         if (p >= end || *p != ']') ason_throw("expected ']'");
         ++p;
     }
@@ -686,12 +700,8 @@ static std::string ason_encode_pretty_typed(py::object obj) {
 // ---------------------------------------------------------------------------
 // Text decode helpers (unchanged from v2)
 // ---------------------------------------------------------------------------
-static inline void skip_ws(const char*& p, const char* end) noexcept {
-    while (p < end && (unsigned char)*p <= ' ') ++p;
-}
-
 static PyObject* decode_value(const char*& p, const char* end, FieldType ft, std::string& tmp) {
-    skip_ws(p, end);
+    skip_ws_comments(p, end);
     if (is_optional(ft)) {
         if (p >= end || *p == ',' || *p == ')') { Py_INCREF(Py_None); return Py_None; }
         ft = base_type(ft);
@@ -743,7 +753,20 @@ static PyObject* decode_value(const char*& p, const char* end, FieldType ft, std
                 return PyUnicode_FromStringAndSize(tmp.data(), (Py_ssize_t)tmp.size());
             } else {
                 const char* s = p;
-                while (p < end && *p != ',' && *p != ')' && *p != '\n' && *p != '\r') ++p;
+                while (p < end && *p != ',' && *p != ')' && *p != '\n' && *p != '\r') {
+                    if (p + 1 < end && p[0] == '/' && p[1] == '*') {
+                        const char* trimmed = p;
+                        while (trimmed > s && (unsigned char)trimmed[-1] <= ' ') --trimmed;
+                        const char* q = p;
+                        skip_ws_comments(q, end);
+                        if (q >= end || *q == ',' || *q == ')' || *q == '\n' || *q == '\r') {
+                            p = q;
+                            return PyUnicode_FromStringAndSize(s, (Py_ssize_t)(trimmed - s));
+                        }
+                        ason_throw("block comments are only allowed between values, not inside an unquoted string");
+                    }
+                    ++p;
+                }
                 return PyUnicode_FromStringAndSize(s, (Py_ssize_t)(p - s));
             }
         }
@@ -752,7 +775,7 @@ static PyObject* decode_value(const char*& p, const char* end, FieldType ft, std
 }
 
 static PyObject* decode_tuple(const char*& p, const char* end, const CachedSchema& sc, std::string& tmp) {
-    skip_ws(p, end);
+    skip_ws_comments(p, end);
     if (p >= end || *p != '(') ason_throw("expected '('");
     ++p;
 
@@ -761,7 +784,7 @@ static PyObject* decode_tuple(const char*& p, const char* end, const CachedSchem
 
     for (size_t i = 0; i < sc.fields.size(); ++i) {
         if (i) {
-            skip_ws(p, end);
+            skip_ws_comments(p, end);
             if (p >= end || *p != ',') { Py_DECREF(rec); ason_throw("expected ','"); }
             ++p;
         }
@@ -770,7 +793,7 @@ static PyObject* decode_tuple(const char*& p, const char* end, const CachedSchem
         PyDict_SetItem(rec, sc.fields[i].key, val);
         Py_DECREF(val);
     }
-    skip_ws(p, end);
+    skip_ws_comments(p, end);
     if (p >= end || *p != ')') { Py_DECREF(rec); ason_throw("expected ')'"); }
     ++p;
     return rec;
@@ -783,18 +806,45 @@ static py::object ason_decode(const std::string& text) {
     const char* p   = text.c_str();
     const char* end = p + text.size();
 
-    skip_ws(p, end);
+    skip_ws_comments(p, end);
     const char* sc_start = p;
     int depth = 0;
+    bool in_quote = false;
+    bool in_comment = false;
     while (p < end) {
         char c = *p++;
+        if (in_comment) {
+            if (c == '*' && p < end && *p == '/') {
+                ++p;
+                in_comment = false;
+            }
+            continue;
+        }
+        if (in_quote) {
+            if (c == '\\' && p < end) {
+                ++p;
+                continue;
+            }
+            if (c == '"') in_quote = false;
+            continue;
+        }
+        if (c == '"') {
+            in_quote = true;
+            continue;
+        }
+        if (c == '/' && p < end && *p == '*') {
+            ++p;
+            in_comment = true;
+            continue;
+        }
         if (c == '{' || c == '[') ++depth;
         else if ((c == '}' || c == ']') && --depth == 0) break;
     }
+    if (in_comment) ason_throw("unterminated block comment");
     std::string sc_str(sc_start, p - sc_start);
     const CachedSchema& schema = get_schema(sc_str);
 
-    skip_ws(p, end);
+    skip_ws_comments(p, end);
     if (p >= end || *p != ':') ason_throw("expected ':'");
     ++p;
 
@@ -804,7 +854,11 @@ static py::object ason_decode(const std::string& text) {
         std::vector<PyObject*> rows;
         rows.reserve(64);
         while (true) {
-            while (p < end && ((unsigned char)*p <= ' ' || *p == ',')) ++p;
+            for (;;) {
+                skip_ws_comments(p, end);
+                if (p < end && *p == ',') { ++p; continue; }
+                break;
+            }
             if (p >= end || *p != '(') break;
             PyObject* rec = decode_tuple(p, end, schema, tmp);
             rows.push_back(rec);
@@ -815,11 +869,15 @@ static py::object ason_decode(const std::string& text) {
             PyList_SET_ITEM(lst, (Py_ssize_t)i, rows[i]);
         return py::reinterpret_steal<py::object>(lst);
     } else {
-        skip_ws(p, end);
+        skip_ws_comments(p, end);
         PyObject* rec = decode_tuple(p, end, schema, tmp);
         if (!rec) throw py::error_already_set();
         const char* tp = p;
-        while (tp < end && ((unsigned char)*tp <= ' ' || *tp == ',')) ++tp;
+        for (;;) {
+            skip_ws_comments(tp, end);
+            if (tp < end && *tp == ',') { ++tp; continue; }
+            break;
+        }
         if (tp < end && *tp == '(') { Py_DECREF(rec); ason_throw("trailing rows not allowed for struct schema"); }
         return py::reinterpret_steal<py::object>(rec);
     }

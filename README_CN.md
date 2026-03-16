@@ -106,6 +106,12 @@ rows = ason.decode('[{id@int, name@str}]:\n(1,Alice),\n(2,Bob)\n')
 rec2 = ason.decode('{id,name}:\n(1,Alice)\n')             # {'id': '1', 'name': 'Alice'}
 ```
 
+在允许空白的位置也支持块注释：
+
+```python
+rec = ason.decode('/* top */ {id@int,name@str}: /* row */ (1, /* name */ Alice)')
+```
+
 ### `encodeBinary(obj) -> bytes` — schema 内部推断
 
 将对象序列化为二进制格式，**不需要传 schema 字符串**：
