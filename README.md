@@ -56,7 +56,7 @@ cmake -B build && cmake --build build
 
 This means `encodeTyped` is safe to use even when only some rows have `None` for a given field.
 
-### `encode(obj) -> str` — untyped schema, inferred
+### `encode(obj) -> str` — schema without scalar hints, inferred
 
 ```python
 ason.encode({"id": 1, "name": "Alice"})
@@ -66,9 +66,9 @@ ason.encode([{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}])
 # → '[{id,name}]:\n(1,Alice),\n(2,Bob)\n'
 ```
 
-> **Untyped decode semantics:** When decoded with `decode()`, all field values are returned as **strings** because the untyped schema carries no type information. Use `encodeTyped` when you need a type-preserving round-trip.
+> **Decode semantics without scalar hints:** When decoded with `decode()`, terminal field values are returned as **strings** because the schema omits scalar type hints. Structural bindings such as `@{}` and `@[]` still remain in the schema. Use `encodeTyped` when you need a type-preserving round-trip.
 
-### `encodeTyped(obj) -> str` — typed schema, inferred
+### `encodeTyped(obj) -> str` — schema with scalar hints, inferred
 
 Type is inferred from all rows (not just the first). A field that is `None` in any row is made optional:
 
@@ -87,7 +87,7 @@ ason.encodeTyped([{"id": 1, "tag": "hello"}, {"id": 2, "tag": None}])
 pretty = ason.encodePretty(rows)
 ```
 
-### `encodePrettyTyped(obj) -> str` — pretty + typed, inferred
+### `encodePrettyTyped(obj) -> str` — pretty + scalar hints, inferred
 
 ```python
 pretty = ason.encodePrettyTyped(rows)
@@ -95,14 +95,14 @@ pretty = ason.encodePrettyTyped(rows)
 
 ### `decode(text) -> dict | list[dict]`
 
-Decodes both typed and untyped schemas embedded in the text:
+Decodes both schemas with scalar hints and schemas without scalar hints embedded in the text:
 
 ```python
-# typed schema → values restored as Python types
+# schema with scalar hints → values restored as Python types
 rec  = ason.decode('{id@int, name@str}:\n(1,Alice)\n')    # {'id': 1, 'name': 'Alice'}
 rows = ason.decode('[{id@int, name@str}]:\n(1,Alice),\n(2,Bob)\n')
 
-# untyped schema → all values returned as strings
+# schema without scalar hints → scalar values returned as strings
 rec2 = ason.decode('{id,name}:\n(1,Alice)\n')             # {'id': '1', 'name': 'Alice'}
 ```
 
@@ -176,12 +176,12 @@ users = [
 ]
 
 # Schema is inferred automatically—no schema string needed
-text        = ason.encode(users)           # untyped schema
-textTyped   = ason.encodeTyped(users)      # typed schema (use for round-trip)
-pretty      = ason.encodePrettyTyped(users)# pretty + typed
+text        = ason.encode(users)            # schema binding without scalar hints
+textTyped   = ason.encodeTyped(users)       # schema binding with scalar hints
+pretty      = ason.encodePrettyTyped(users) # pretty + scalar hints
 blob        = ason.encodeBinary(users)     # binary (schema inferred internally)
 
-assert ason.decode(textTyped)  == users    # typed round-trip
+assert ason.decode(textTyped)  == users    # round-trip with scalar hints
 assert ason.decode(pretty)     == users
 assert ason.decodeBinary(blob, "[{id@int, name@str, score@float}]") == users
 ```

@@ -56,7 +56,7 @@ cmake -B build && cmake --build build
 
 这意味着即使只有部分行有 `None`，也可以安全使用 `encodeTyped`。
 
-### `encode(obj) -> str` — 无类型 schema，自动推断
+### `encode(obj) -> str` — 不带基本类型提示的 schema，自动推断
 
 ```python
 ason.encode({"id": 1, "name": "Alice"})
@@ -66,9 +66,9 @@ ason.encode([{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}])
 # → '[{id,name}]:\n(1,Alice),\n(2,Bob)\n'
 ```
 
-> **无类型解码语义：** 使用 `decode()` 解码时，所有字段值都以**字符串**形式返回（因为无类型 schema 不含类型信息）。如需保真 round-trip，请使用 `encodeTyped`。
+> **不带基本类型提示时的解码语义：** 使用 `decode()` 解码时，终端字段值都以**字符串**形式返回（因为 schema 未提供这些基本类型提示）。`@{}` / `@[]` 这类结构绑定仍然保留。如需保真 round-trip，请使用 `encodeTyped`。
 
-### `encodeTyped(obj) -> str` — 有类型 schema，自动推断
+### `encodeTyped(obj) -> str` — 带基本类型提示的 schema，自动推断
 
 从**所有行**推断类型（不只看第一行）。如果某行有 `None`，该字段就会自动变为可选类型：
 
@@ -87,7 +87,7 @@ ason.encodeTyped([{"id": 1, "tag": "hello"}, {"id": 2, "tag": None}])
 pretty = ason.encodePretty(rows)
 ```
 
-### `encodePrettyTyped(obj) -> str` — pretty + 有类型，自动推断
+### `encodePrettyTyped(obj) -> str` — pretty + 基本类型提示，自动推断
 
 ```python
 pretty = ason.encodePrettyTyped(rows)
@@ -95,14 +95,14 @@ pretty = ason.encodePrettyTyped(rows)
 
 ### `decode(text) -> dict | list[dict]`
 
-支持 typed 和 untyped 两种 schema：
+支持带基本类型提示和不带基本类型提示两种 schema：
 
 ```python
-# typed schema → 还原 Python 类型
+# 带基本类型提示的 schema → 还原 Python 类型
 rec  = ason.decode('{id@int, name@str}:\n(1,Alice)\n')    # {'id': 1, 'name': 'Alice'}
 rows = ason.decode('[{id@int, name@str}]:\n(1,Alice),\n(2,Bob)\n')
 
-# untyped schema → 所有值以字符串返回
+# 不带基本类型提示的 schema → 终端值以字符串返回
 rec2 = ason.decode('{id,name}:\n(1,Alice)\n')             # {'id': '1', 'name': 'Alice'}
 ```
 
@@ -178,12 +178,12 @@ users = [
 ]
 
 # schema 自动推断——不需要手动传 schema 字符串
-text        = ason.encode(users)           # 无类型 schema（更短）
-textTyped   = ason.encodeTyped(users)      # 有类型 schema
-pretty      = ason.encodePrettyTyped(users)# pretty + 有类型
+text        = ason.encode(users)           # 不带基本类型提示的 schema（更短）
+textTyped   = ason.encodeTyped(users)      # 带基本类型提示的 schema
+pretty      = ason.encodePrettyTyped(users)# pretty + 基本类型提示
 blob        = ason.encodeBinary(users)     # 二进制（schema 内部推断）
 
-assert ason.decode(textTyped) == users     # 有类型 round-trip（完整还原）
+assert ason.decode(textTyped) == users     # 带基本类型提示的 round-trip（完整还原）
 assert ason.decode(pretty)    == users
 assert ason.decodeBinary(blob, "[{id@int, name@str, score@float}]") == users
 ```
@@ -222,7 +222,7 @@ ASON（约 35 tokens，节省 65%）：
 | Token 效率 | 100% | 30–70% ✓ |
 | 键名重复 | 每个对象 | 只声明一次 ✓ |
 | 可读性 | 是 | 是 ✓ |
-| 类型注解 | 无 | 有 ✓ |
+| 字段绑定与基本类型提示 | 无 | 支持 ✓ |
 | 数据体积 | 100% | **40–50%** ✓ |
 
 ---
