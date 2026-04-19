@@ -11,6 +11,35 @@ wheel 中同时包含 `asun.pyi` 和 `py.typed`，因此编辑器和静态类型
 
 ---
 
+## 为什么选择 ASUN
+
+**json**
+
+标准 JSON 会在每条记录里重复所有字段名。无论是发给 LLM、通过 API 传输，还是服务之间交换数据，这种重复都会浪费 Token、带宽和阅读成本：
+
+```json
+[
+  { "id": 1, "name": "Alice", "active": true },
+  { "id": 2, "name": "Bob", "active": false },
+  { "id": 3, "name": "Carol", "active": true }
+]
+```
+
+**asun**
+
+ASUN 只声明 **一次** Schema，后续每一行只保留值：
+
+```asun
+[{id, name, active}]:
+  (1,Alice,true),
+  (2,Bob,false),
+  (3,Carol,true)
+```
+
+**这通常意味着更少的 token、更小的体积，更清晰的结构, 以及比重复键名 JSON 更快的解析。**
+
+---
+
 ## 环境要求
 
 | 工具        | 版本                    |

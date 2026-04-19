@@ -10,7 +10,7 @@
 //
 // Current scope:
 //   flat structs / slices with scalar + optional scalar fields
-//   no legacy map syntax
+//   no map-style schema syntax
 //
 // Type inference rules:
 //   PyBool       → bool
@@ -297,7 +297,7 @@ static CachedSchema parse_schema(const std::string& s) {
     CachedSchema sc;
 
     if (s.find('<') != std::string::npos || s.find('>') != std::string::npos) {
-        asun_throw("legacy map syntax '<...>' is not supported; use arrays or entry lists instead");
+        asun_throw("unsupported schema syntax");
     }
 
     skip_ws_comments(p, end);
