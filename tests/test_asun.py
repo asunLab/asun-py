@@ -388,14 +388,14 @@ class TestFieldNamesSpecialChars:
 
         untyped = asun.encode(obj)
         assert untyped.startswith('{"id uuid","65","{}[]@\\""')
-        assert asun.decode(untyped) == {"id uuid": "1", "65": "Alice", '{}[]@"': "true"}
+        assert asun.decode(untyped) == {"id uuid": 1, "65": "Alice", '{}[]@"': True}
 
         typed = asun.encodeTyped(obj)
         assert typed.startswith('{"id uuid"@int,"65"@str,"{}[]@\\""@bool}')
         assert asun.decode(typed) == obj
 
         pretty = asun.encodePretty(obj)
-        assert asun.decode(pretty) == {"id uuid": "1", "65": "Alice", '{}[]@"': "true"}
+        assert asun.decode(pretty) == {"id uuid": 1, "65": "Alice", '{}[]@"': True}
 
         pretty_typed = asun.encodePrettyTyped(obj)
         assert asun.decode(pretty_typed) == obj

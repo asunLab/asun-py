@@ -57,7 +57,8 @@ namespace py = pybind11;
 // ---------------------------------------------------------------------------
 enum class FieldType : uint8_t {
     Int, Uint, Float_, Bool, Str,
-    IntOpt, UintOpt, FloatOpt, BoolOpt, StrOpt
+    IntOpt, UintOpt, FloatOpt, BoolOpt, StrOpt,
+    Auto   // untyped field: auto-detect at decode time
 };
 static constexpr bool is_optional(FieldType t) noexcept { return (uint8_t)t >= 5; }
 static constexpr FieldType base_type(FieldType t) noexcept {
@@ -76,6 +77,7 @@ static const char* type_name(FieldType ft) noexcept {
         case FieldType::FloatOpt: return "float?";
         case FieldType::BoolOpt:  return "bool?";
         case FieldType::StrOpt:   return "str?";
+        case FieldType::Auto:     return "auto";
     }
     return "str";
 }
@@ -340,7 +342,7 @@ static CachedSchema parse_schema(const std::string& s) {
         skip_ws_comments(p, end);
 
         // ── typed field: "name@type" ──────────────────────────────────────────
-        FieldType ft = FieldType::Str;  // default for untyped fields
+        FieldType ft = FieldType::Auto;  // default: auto-detect at decode time
         if (p < end && *p == '@') {
             ++p;  // consume '@'
             skip_ws_comments(p, end);
@@ -361,7 +363,7 @@ static CachedSchema parse_schema(const std::string& s) {
             else if (tname == "str")   ft = opt ? FieldType::StrOpt   : FieldType::Str;
             else asun_throw("unknown type '" + tname + "' for field '" + name + "'");
         }
-        // else: untyped field (no '@type') → treat as str (decode returns strings)
+        // else: untyped field (no '@type') → Auto (decode auto-detects type)
 
         PyObject* key = PyUnicode_FromStringAndSize(name.data(), (Py_ssize_t)name.size());
         if (!key) throw std::bad_alloc();
@@ -702,6 +704,43 @@ static std::string asun_encode_pretty_typed(py::object obj) {
 // ---------------------------------------------------------------------------
 static PyObject* decode_value(const char*& p, const char* end, FieldType ft, std::string& tmp) {
     skip_ws_comments(p, end);
+    // Handle Auto type first (before optional check)
+    if (ft == FieldType::Auto) {
+        if (p >= end || *p == ',' || *p == ')') { Py_INCREF(Py_None); return Py_None; }
+        // Bool?
+        if (end-p>=4&&p[0]=='t'&&p[1]=='r'&&p[2]=='u'&&p[3]=='e'
+            &&(p+4>=end||p[4]==','||p[4]==')'||p[4]==']'||(unsigned char)p[4]<=' '))
+            { p+=4; Py_INCREF(Py_True); return Py_True; }
+        if (end-p>=5&&p[0]=='f'&&p[1]=='a'&&p[2]=='l'&&p[3]=='s'&&p[4]=='e'
+            &&(p+5>=end||p[5]==','||p[5]==')'||p[5]==']'||(unsigned char)p[5]<=' '))
+            { p+=5; Py_INCREF(Py_False); return Py_False; }
+        // Quoted string?
+        if (*p == '"') return decode_value(p, end, FieldType::Str, tmp);
+        // Number?  -?[0-9]
+        if ((*p >= '0' && *p <= '9') || (*p == '-' && p+1 < end && p[1] >= '0' && p[1] <= '9')) {
+            const char* start = p;
+            if (*p == '-') ++p;
+            while (p < end && *p >= '0' && *p <= '9') ++p;
+            if (p < end && *p == '.') {
+                ++p;
+                while (p < end && *p >= '0' && *p <= '9') ++p;
+                if (p >= end || *p == ',' || *p == ')' || *p == ']' || (unsigned char)*p <= ' ') {
+                    double v; std::from_chars(start, p, v);
+                    return PyFloat_FromDouble(v);
+                }
+            } else {
+                if (p >= end || *p == ',' || *p == ')' || *p == ']' || (unsigned char)*p <= ' ') {
+                    long long v = 0; bool neg = (*start == '-');
+                    const char* q = neg ? start + 1 : start;
+                    while (q < p) { v = v * 10 + (*q - '0'); ++q; }
+                    return PyLong_FromLongLong(neg ? -v : v);
+                }
+            }
+            p = start;  // rewind — not a valid number
+        }
+        // Fallback: plain string
+        return decode_value(p, end, FieldType::Str, tmp);
+    }
     if (is_optional(ft)) {
         if (p >= end || *p == ',' || *p == ')') { Py_INCREF(Py_None); return Py_None; }
         ft = base_type(ft);
